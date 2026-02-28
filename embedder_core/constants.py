@@ -1,0 +1,5 @@
+PAD = "<PAD>"
+UNK = "<UNK>"
+MASK = "<MASK>"
+
+SPECIAL_TOKENS = [PAD, UNK, MASK]
