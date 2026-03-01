@@ -3,7 +3,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -20,6 +20,20 @@ class SessionData:
     enrollment_mean: Optional[np.ndarray]
     enrollment_inv_cov: Optional[np.ndarray]
     distance_threshold: float = DEFAULT_DISTANCE_THRESHOLD
+
+
+FeatureBuilder = Callable[[Dict[str, Any]], np.ndarray]
+_feature_builder: FeatureBuilder = build_feature_vector_from_raw_run
+
+
+def set_feature_builder(builder: Optional[FeatureBuilder]) -> None:
+    global _feature_builder
+    _feature_builder = build_feature_vector_from_raw_run if builder is None else builder
+
+
+def _build_feature_from_raw_run(run: Dict[str, Any]) -> np.ndarray:
+    feat = _feature_builder(run)
+    return np.asarray(feat, dtype=np.float32)
 
 
 def _copy_samples(samples: List[np.ndarray]) -> List[np.ndarray]:
@@ -51,11 +65,11 @@ def _deserialize_raw_runs(raw: Any, field_name: str) -> Tuple[List[Dict[str, Any
     for i, item in enumerate(raw):
         try:
             run = normalize_raw_run(item)
-            feat = build_feature_vector_from_raw_run(run)
+            feat = _build_feature_from_raw_run(run)
         except Exception as ex:
             raise ValueError(f"{field_name}[{i}] is not a valid native key event run: {ex}") from ex
         out_runs.append(run)
-        out_features.append(np.asarray(feat, dtype=np.float32))
+        out_features.append(feat)
     return out_runs, out_features
 
 
@@ -102,11 +116,11 @@ def _validate_dimensions(data: SessionData):
         if int(arr.shape[0]) != dim:
             raise ValueError(f"Test sample #{i + 1} has wrong feature dimension.")
     for i, run in enumerate(data.enrollment_raw_runs):
-        feat = build_feature_vector_from_raw_run(run)
+        feat = _build_feature_from_raw_run(run)
         if int(feat.shape[0]) != dim:
             raise ValueError(f"Enrollment raw run #{i + 1} has wrong derived feature dimension.")
     for i, run in enumerate(data.test_raw_runs):
-        feat = build_feature_vector_from_raw_run(run)
+        feat = _build_feature_from_raw_run(run)
         if int(feat.shape[0]) != dim:
             raise ValueError(f"Test raw run #{i + 1} has wrong derived feature dimension.")
 
@@ -193,6 +207,17 @@ def payload_to_session_data(payload: Dict[str, Any]) -> SessionData:
 
     enrollment_inv_cov = _deserialize_matrix(payload.get("enrollment_inv_cov"), "enrollment_inv_cov")
 
+    sample_dim: Optional[int] = None
+    if enrollment_samples:
+        sample_dim = int(enrollment_samples[0].shape[0])
+    elif test_samples:
+        sample_dim = int(test_samples[0].shape[0])
+    if sample_dim is not None:
+        if enrollment_mean is not None and int(enrollment_mean.shape[0]) != sample_dim:
+            enrollment_mean = None
+        if enrollment_inv_cov is not None and enrollment_inv_cov.shape != (sample_dim, sample_dim):
+            enrollment_inv_cov = None
+
     distance_threshold_raw = payload.get("distance_threshold", payload.get("score_threshold"))
     distance_threshold = _normalize_distance_threshold(distance_threshold_raw)
 
@@ -211,7 +236,8 @@ def payload_to_session_data(payload: Dict[str, Any]) -> SessionData:
     if isinstance(feature_dim, int):
         dim = _feature_dim(data)
         if dim is not None and dim != feature_dim:
-            raise ValueError(f"Dataset feature_dim ({feature_dim}) does not match data vectors ({dim}).")
+            # Keep loading when feature extraction backend differs from the dataset creator.
+            pass
 
     if data.enrollment_mean is None or data.enrollment_inv_cov is None:
         mean, inv_cov = _compute_enrollment_stats(data.enrollment_samples)

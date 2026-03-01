@@ -6,6 +6,8 @@ PROMPT_QUEUE_SIZE = 5
 SENTENCE_DATASET_PATH = APP_ROOT / "medium_english_sentences.txt"
 
 DEFAULT_DATASET_PATH = APP_ROOT / "keystroke_dataset.json"
+DEFAULT_EMBEDDER_FINAL_WEIGHTS_PATH = APP_ROOT / "keystroke_user_classifier_keysym_final_weights.pt"
+DEFAULT_EMBEDDER_CHECKPOINT_PATH = APP_ROOT / "keystroke_user_classifier_keysym.pt"
 
 DATASET_VERSION = 3
 

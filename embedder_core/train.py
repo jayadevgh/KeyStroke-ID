@@ -16,7 +16,7 @@ from .vocab import build_keysym_vocab
 
 @dataclass
 class TrainConfig:
-    epochs: int = 40
+    epochs: int = 0
     batch_size: int = 32
     lr: float = 2e-4
     weight_decay: float = 0.01
@@ -207,7 +207,17 @@ def train(
                 print("Early stopping.")
                 break
 
-    torch.save(model.state_dict(), cfg.final_weights_path)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "stoi": stoi,
+            "itos": itos,
+            "train_cfg": cfg.__dict__,
+            "aug_cfg": aug.__dict__,
+            "num_classes": len(user_json_paths),
+        },
+        cfg.final_weights_path,
+    )
     print(f"Saved final weights -> {cfg.final_weights_path}")
 
     if best_model_state is not None:

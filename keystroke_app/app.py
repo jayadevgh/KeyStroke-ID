@@ -14,6 +14,7 @@ from .config import (
     PROMPT_QUEUE_SIZE,
     SENTENCE_DATASET_PATH,
 )
+from .embedder_runtime import EmbedderRuntime, try_load_default_embedder_runtime
 from .profile_manager import ProfileManager
 from .prompts import PromptQueue, load_sentence_bank
 from .storage import (
@@ -21,6 +22,7 @@ from .storage import (
     load_session_data,
     merge_session_data_file,
     save_session_data,
+    set_feature_builder,
 )
 from .verifier import Verifier
 
@@ -41,6 +43,19 @@ class App(tk.Tk):
         self.capture = RunCapture()
         self.verifier = Verifier()
         self.profile_manager = ProfileManager()
+        self.embedder_runtime: Optional[EmbedderRuntime] = None
+        self.feature_backend_name: str = "handcrafted"
+        self._embedder_startup_message: str = ""
+
+        runtime, runtime_msg = try_load_default_embedder_runtime()
+        if runtime is not None:
+            self.embedder_runtime = runtime
+            self.feature_backend_name = "embedder"
+            self._embedder_startup_message = runtime_msg
+            set_feature_builder(runtime.build_feature_vector_from_raw_run)
+        else:
+            self._embedder_startup_message = runtime_msg
+            set_feature_builder(None)
 
         self.enroll_samples: List[np.ndarray] = []
         self.enroll_raw_runs: List[Dict[str, Any]] = []
@@ -62,7 +77,11 @@ class App(tk.Tk):
 
         self._build_ui()
         self._render_prompt_queue()
-        self._set_status("Click 'Start Enrollment' or load a dataset.")
+        self._set_status(
+            f"Feature backend: {self.feature_backend_name}. Click 'Start Enrollment' or load a dataset."
+        )
+        if self._embedder_startup_message:
+            self._log(self._embedder_startup_message)
         self._update_progress_ui()
         self._update_runs_label()
         self._set_idle_controls()
@@ -225,6 +244,11 @@ class App(tk.Tk):
 
     def _set_status(self, msg: str):
         self.lbl_status.configure(text=msg)
+
+    def _build_run_feature(self, raw_run: Dict[str, Any]) -> np.ndarray:
+        if self.embedder_runtime is not None:
+            return self.embedder_runtime.build_feature_vector_from_raw_run(raw_run)
+        return build_feature_vector_from_raw_run(raw_run)
 
     @staticmethod
     def _first_mismatch_index(typed: str, target: str) -> Optional[int]:
@@ -814,7 +838,7 @@ class App(tk.Tk):
             if raw_run is None:
                 self._log("Run matched text but no usable timing data was captured; avoid paste and type the prompt.")
             else:
-                feat = build_feature_vector_from_raw_run(raw_run)
+                feat = self._build_run_feature(raw_run)
                 if self.phase == "enroll":
                     self.enroll_samples.append(feat)
                     self.enroll_raw_runs.append(deepcopy(raw_run))
