@@ -148,14 +148,8 @@ def _compute_enrollment_stats(
 
 
 def _normalize_distance_threshold(raw: Any) -> float:
-    if not isinstance(raw, (int, float)):
-        return float(DEFAULT_DISTANCE_THRESHOLD)
-    value = float(raw)
-    if value <= 0.0:
-        return float(DEFAULT_DISTANCE_THRESHOLD)
-    if abs(value - LEGACY_SCORE_THRESHOLD) < 1e-6:
-        return float(DEFAULT_DISTANCE_THRESHOLD)
-    return value
+    # Thresholds now come exclusively from application config.
+    return float(DEFAULT_DISTANCE_THRESHOLD)
 
 
 def session_data_to_payload(data: SessionData, dataset_version: int) -> Dict[str, Any]:
@@ -304,7 +298,7 @@ def merge_session_data_file(path: Path, incoming: SessionData, dataset_version: 
             test_raw_runs=[],
             enrollment_mean=None,
             enrollment_inv_cov=None,
-            distance_threshold=4.5,
+            distance_threshold=float(DEFAULT_DISTANCE_THRESHOLD),
         )
     merged = merge_session_data(base, incoming)
     save_session_data(path, merged, dataset_version)

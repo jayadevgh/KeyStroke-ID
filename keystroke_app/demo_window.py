@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
-from tkinter import ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .capture import RunCapture
+from .config import DEFAULT_DISTANCE_THRESHOLD
 from .profile_manager import ProfileManager
 from .prompts import PromptQueue
 from .touch_id import HAS_NATIVE_TOUCH_ID, request_touch_id
@@ -28,8 +28,6 @@ FONT_UI_BOLD = ("Helvetica Neue", 13, "bold")
 HYSTERESIS_THRESHOLD = 3
 TOUCH_ID_TRIGGER_CONSECUTIVE = 3
 SCORE_HISTORY_MAX = 30
-LIVE_WINDOW_INTERVAL_MS = 6000
-LIVE_WINDOW_MIN_PRINTABLE = 30
 
 
 class DemoWindow(tk.Toplevel):
@@ -53,7 +51,6 @@ class DemoWindow(tk.Toplevel):
 
         self.capture = RunCapture()
         self.prompt_queue = PromptQueue(sentence_bank, 3)
-        self.live_window_capture = RunCapture()
 
         self.demo_running = False
         self.phase = "idle"
@@ -65,7 +62,7 @@ class DemoWindow(tk.Toplevel):
 
         self.hysteresis_state = "unknown"
         self.hysteresis_consecutive = 0
-        self.displayed_state = "unknown"
+        self.displayed_state = "pending"
 
         self.touch_id_triggered = False
         self.touch_id_in_progress = False
@@ -76,15 +73,18 @@ class DemoWindow(tk.Toplevel):
         self.session_votes: Dict[str, int] = {}
         self.score_history: List[Tuple[int, str, float, bool]] = []
         self.analysis_window_count = 0
-        self.timed_window_count = 0
-        self.live_window_job: Optional[str] = None
 
         self._profile_bar_widgets: Dict[str, Tuple[tk.Label, tk.Canvas, tk.Label]] = {}
+        self._current_sentence_start_line: int = 1
 
         self._build_ui()
         self._bind_keys()
         self._update_idle_ui()
         self._poll_touch_id_result()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
 
     def _build_ui(self):
         self.columnconfigure(0, weight=3)
@@ -264,6 +264,7 @@ class DemoWindow(tk.Toplevel):
         )
         self.input_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 8))
         self.input_box.tag_configure("mismatch", foreground=ACCENT_RED)
+        self.input_box.tag_configure("done", foreground="#555555")
         self.input_box.focus_set()
 
         stats_outer = tk.Frame(right, bg=PANEL_BG)
@@ -338,9 +339,132 @@ class DemoWindow(tk.Toplevel):
         )
         self.lbl_backend.pack(side="right", padx=12, pady=6)
 
+    # ------------------------------------------------------------------
+    # Key bindings
+    # ------------------------------------------------------------------
+
     def _bind_keys(self):
         self.input_box.bind("<KeyPress>", self._on_key_press)
         self.input_box.bind("<KeyRelease>", self._on_key_release)
+
+    def _on_key_press(self, event):
+        if not self.demo_running or self.phase != "running":
+            return
+        self.capture.on_key_press(event)
+
+    def _on_key_release(self, event):
+        if not self.demo_running or self.phase != "running":
+            return
+        self.capture.on_key_release(event)
+        self.after_idle(self._maybe_accept_run)
+
+    # ------------------------------------------------------------------
+    # Core sentence acceptance logic
+    # ------------------------------------------------------------------
+
+    def _get_current_line_text(self) -> str:
+        end_index = self.input_box.index("end-1c")
+        last_line = int(end_index.split(".")[0])
+        return self.input_box.get(
+            f"{self._current_sentence_start_line}.0",
+            f"{last_line}.end",
+        )
+
+    def _maybe_accept_run(self):
+        if not self.demo_running or self.phase != "running":
+            return
+
+        typed = self._get_current_line_text()
+        target = self.prompt_queue.current()
+        self._update_mismatch_highlight(typed, target)
+
+        if not self._typed_matches_target(typed, target):
+            return
+
+        raw_run = self.capture.build_raw_run()
+        if raw_run is not None:
+            try:
+                feat = self.get_feature_fn(raw_run)
+            except Exception as ex:
+                self._set_status(f"Scoring error: {ex}")
+            else:
+                self._process_score(feat)
+
+        # Grey out completed sentence
+        start_idx = f"{self._current_sentence_start_line}.0"
+        end_idx = self.input_box.index("end-1c")
+        self.input_box.tag_add("done", start_idx, end_idx)
+        self.input_box.tag_remove("mismatch", "1.0", "end")
+
+        # Insert newline so user continues on next line
+        self.input_box.insert("end", "\n")
+        self.input_box.see("end")
+
+        # Record new sentence start line
+        new_end = self.input_box.index("end-1c")
+        self._current_sentence_start_line = int(new_end.split(".")[0])
+
+        self.prompt_queue.advance()
+        self._update_prompt_label(announce=True)
+        self.capture.reset()
+
+    # ------------------------------------------------------------------
+    # Prompt label
+    # ------------------------------------------------------------------
+
+    def _update_prompt_label(self, announce: bool = False):
+        if self.demo_running:
+            sentence = self.prompt_queue.current()
+            self.lbl_prompt.configure(text=sentence)
+            if announce:
+                self._log(f"[prompt] {sentence}")
+        else:
+            self.lbl_prompt.configure(text="")
+
+    # ------------------------------------------------------------------
+    # Mismatch highlighting (current line only)
+    # ------------------------------------------------------------------
+
+    def _update_mismatch_highlight(self, typed: str, target: str):
+        start_idx = f"{self._current_sentence_start_line}.0"
+        self.input_box.tag_remove("mismatch", start_idx, "end")
+
+        limit = min(len(typed), len(target))
+        mismatch_col = None
+        for i in range(limit):
+            if typed[i] != target[i]:
+                mismatch_col = i
+                break
+        if mismatch_col is None and len(typed) > len(target):
+            mismatch_col = len(target)
+
+        if mismatch_col is not None and mismatch_col < len(typed):
+            ms = f"{self._current_sentence_start_line}.{mismatch_col}"
+            me = f"{self._current_sentence_start_line}.{len(typed)}"
+            self.input_box.tag_add("mismatch", ms, me)
+
+    # ------------------------------------------------------------------
+    # Comparison helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_for_compare(text: str) -> str:
+        text = text.replace("\r", " ").replace("\n", " ")
+        return " ".join(text.split())
+
+    @classmethod
+    def _typed_matches_target(cls, typed: str, target: str) -> bool:
+        if typed == target:
+            return True
+        if typed.rstrip() == target:
+            return True
+        if cls._normalize_for_compare(typed) == cls._normalize_for_compare(target):
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Demo start / stop
+    # ------------------------------------------------------------------
 
     def _set_status(self, msg: str):
         self.lbl_status_bar.configure(text=msg)
@@ -367,10 +491,9 @@ class DemoWindow(tk.Toplevel):
         self.session_votes.clear()
         self.score_history.clear()
         self.analysis_window_count = 0
-        self.timed_window_count = 0
         self.hysteresis_state = "unknown"
         self.hysteresis_consecutive = 0
-        self.displayed_state = "unknown"
+        self.displayed_state = "pending"
         self.consecutive_unknown_count = 0
         self.touch_id_triggered = False
         self.touch_id_in_progress = False
@@ -378,22 +501,22 @@ class DemoWindow(tk.Toplevel):
         self.current_identity = None
         self.current_closest = None
         self.all_distances = {}
-        self.live_window_capture.reset()
+        self.capture.reset()
+
+        self.input_box.delete("1.0", "end")
+        self._current_sentence_start_line = 1
 
         self.prompt_queue.reset()
-        self._update_prompt_label()
-        self.input_box.delete("1.0", "end")
-        self.capture.reset()
+        self._update_prompt_label(announce=True)
 
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-
         self.lbl_profiles_list.configure(text="  ".join(profiles))
 
         self._set_identity_display("running_no_data")
         self._set_status("DEMO RUNNING — type the prompt sentences naturally")
         self._update_profile_bars_init()
-        self._start_live_window_loop()
+        self.input_box.focus_set()
 
     def stop_demo(self):
         self.demo_running = False
@@ -401,151 +524,16 @@ class DemoWindow(tk.Toplevel):
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
         self.input_box.delete("1.0", "end")
+        self._current_sentence_start_line = 1
         self.capture.reset()
-        self._cancel_live_window_loop()
-        self.live_window_capture.reset()
         self._set_status(f"Demo stopped. {self.sentence_count} sentence(s) typed.")
         self._set_identity_display("idle")
 
-    def _on_key_press(self, event):
-        if not self.demo_running:
-            return
-        if self.phase != "running":
-            self._start_live_window_loop()
-            return
-        self.capture.on_key_press(event)
-        self.live_window_capture.on_key_press(event)
+    # ------------------------------------------------------------------
+    # Scoring / identity display
+    # ------------------------------------------------------------------
 
-        if event.keysym in {
-            "Shift_L",
-            "Shift_R",
-            "Control_L",
-            "Control_R",
-            "Alt_L",
-            "Alt_R",
-            "Caps_Lock",
-        }:
-            return
-
-        if event.keysym == "BackSpace":
-            self.after(1, self._maybe_accept_run)
-            return
-
-        if event.keysym in {
-            "Delete",
-            "Left",
-            "Right",
-            "Up",
-            "Down",
-            "Home",
-            "End",
-            "Return",
-        }:
-            return "break"
-
-        ch = event.char
-        if ch == "":
-            return "break"
-
-        self.input_box.tag_remove("sel", "1.0", "end")
-        self.input_box.mark_set("insert", "end-1c")
-        self.after(1, self._maybe_accept_run)
-
-    def _on_key_release(self, event):
-        if not self.demo_running or self.phase != "running":
-            return
-        self.capture.on_key_release(event)
-        self.live_window_capture.on_key_release(event)
-
-    def _maybe_accept_run(self):
-        if not self.demo_running or self.phase != "running":
-            return
-
-        typed = self.input_box.get("1.0", "end-1c")
-        target = self.prompt_queue.current()
-        self._update_mismatch_highlight(typed, target)
-
-        if typed == target:
-            raw_run = self.capture.build_raw_run()
-            if raw_run is not None:
-                try:
-                    feat = self.get_feature_fn(raw_run)
-                except Exception as ex:
-                    self._set_status(f"Scoring error: {ex}")
-                else:
-                    self._process_score(feat, source="sentence")
-
-            self.prompt_queue.advance()
-            self._update_prompt_label()
-            self.input_box.delete("1.0", "end")
-            self.input_box.tag_remove("mismatch", "1.0", "end")
-            self.capture.reset()
-            self.live_window_capture.reset()
-
-    def _update_prompt_label(self):
-        if self.demo_running:
-            self.lbl_prompt.configure(text=self.prompt_queue.current())
-        else:
-            self.lbl_prompt.configure(text="")
-
-    def _update_mismatch_highlight(self, typed: str, target: str):
-        self.input_box.tag_remove("mismatch", "1.0", "end")
-        limit = min(len(typed), len(target))
-        mismatch_idx = None
-        for i in range(limit):
-            if typed[i] != target[i]:
-                mismatch_idx = i
-                break
-        if mismatch_idx is None and len(typed) > len(target):
-            mismatch_idx = len(target)
-        if mismatch_idx is not None and mismatch_idx < len(typed):
-            start = f"1.0+{mismatch_idx}c"
-            end = f"1.0+{len(typed)}c"
-            self.input_box.tag_add("mismatch", start, end)
-
-    @staticmethod
-    def _count_printable_events(events: List[Any]) -> int:
-        count = 0
-        for ev in events:
-            if getattr(ev, "kind", "") != "keydown":
-                continue
-            ch = str(getattr(ev, "char", ""))
-            if ch == " " or (ch and ch.isprintable()):
-                count += 1
-        return count
-
-    def _start_live_window_loop(self):
-        self._cancel_live_window_loop()
-        self.live_window_job = self.after(LIVE_WINDOW_INTERVAL_MS, self._live_window_tick)
-
-    def _cancel_live_window_loop(self):
-        if self.live_window_job is not None:
-            try:
-                self.after_cancel(self.live_window_job)
-            except Exception:
-                pass
-            self.live_window_job = None
-
-    def _live_window_tick(self):
-        self.live_window_job = None
-        if not self.demo_running or self.phase != "running":
-            return
-
-        printable = self._count_printable_events(self.live_window_capture.events)
-        if printable >= LIVE_WINDOW_MIN_PRINTABLE:
-            raw_run = self.live_window_capture.build_raw_run()
-            if raw_run is not None:
-                try:
-                    feat = self.get_feature_fn(raw_run)
-                except Exception as ex:
-                    self._set_status(f"Live window scoring error: {ex}")
-                else:
-                    self._process_score(feat, source="window")
-            self.live_window_capture.reset()
-
-        self._start_live_window_loop()
-
-    def _process_score(self, feat: np.ndarray, source: str):
+    def _process_score(self, feat: np.ndarray):
         X = feat.reshape(1, -1)
         try:
             best_name, best_dist, all_dists = self.profile_manager.identify(X)
@@ -559,12 +547,7 @@ class DemoWindow(tk.Toplevel):
         closest_name = min(all_dists, key=all_dists.get)
         closest_dist = float(all_dists[closest_name])
 
-        if source == "sentence":
-            self.sentence_count += 1
-            log_label = f"sentence {self.sentence_count}"
-        else:
-            self.timed_window_count += 1
-            log_label = f"window {self.timed_window_count}"
+        self.sentence_count += 1
         self.analysis_window_count += 1
 
         self.current_closest = closest_name
@@ -573,13 +556,14 @@ class DemoWindow(tk.Toplevel):
 
         if best_name is not None:
             self.current_identity = best_name
-            if source == "sentence":
-                self.session_votes[best_name] = self.session_votes.get(best_name, 0) + 1
+            self.session_votes[best_name] = self.session_votes.get(best_name, 0) + 1
         else:
             self.current_identity = None
 
         is_identified = best_name is not None
-        self.score_history.append((self.analysis_window_count, closest_name, closest_dist, is_identified))
+        self.score_history.append(
+            (self.analysis_window_count, closest_name, closest_dist, is_identified)
+        )
         if len(self.score_history) > SCORE_HISTORY_MAX:
             self.score_history.pop(0)
 
@@ -590,13 +574,22 @@ class DemoWindow(tk.Toplevel):
             self.hysteresis_state = new_state
             self.hysteresis_consecutive = 1
 
-        if self.hysteresis_consecutive >= HYSTERESIS_THRESHOLD or self.analysis_window_count == 1:
-            self.displayed_state = self.hysteresis_state
-
-        if self.displayed_state == "unknown":
-            self.consecutive_unknown_count += 1
-        else:
+        # 3 consecutive unknown sentences triggers impostor detection
+        if new_state == "identified":
             self.consecutive_unknown_count = 0
+        else:
+            self.consecutive_unknown_count += 1
+
+        should_update_display = False
+        if self.hysteresis_state == "identified":
+            if self.hysteresis_consecutive >= HYSTERESIS_THRESHOLD or self.analysis_window_count == 1:
+                should_update_display = True
+        else:
+            if self.consecutive_unknown_count >= TOUCH_ID_TRIGGER_CONSECUTIVE:
+                should_update_display = True
+
+        if should_update_display:
+            self.displayed_state = self.hysteresis_state
 
         if (
             self.consecutive_unknown_count >= TOUCH_ID_TRIGGER_CONSECUTIVE
@@ -607,14 +600,19 @@ class DemoWindow(tk.Toplevel):
 
         self._update_identity_display()
         self._update_profile_bars()
-        if source == "sentence":
-            self._update_votes_label()
-            self._update_sentence_count_label()
+        self._update_votes_label()
+        self._update_sentence_count_label()
         self._redraw_graph()
 
-        all_dists_str = " | ".join(f"{k}: {v:.2f}" for k, v in sorted(all_dists.items(), key=lambda x: x[1]))
-        verdict = f"IDENTIFIED: {best_name}" if best_name is not None else f"UNKNOWN (closest: {closest_name})"
-        self._log(f"[{log_label}]  {all_dists_str}  →  {verdict}")
+        all_dists_str = " | ".join(
+            f"{k}: {v:.2f}" for k, v in sorted(all_dists.items(), key=lambda x: x[1])
+        )
+        verdict = (
+            f"IDENTIFIED: {best_name}"
+            if best_name is not None
+            else f"UNKNOWN (closest: {closest_name})"
+        )
+        self._log(f"[sentence {self.sentence_count}]  {all_dists_str}  →  {verdict}")
 
     def _set_identity_display(self, mode: str):
         if mode == "idle":
@@ -634,7 +632,7 @@ class DemoWindow(tk.Toplevel):
             self.lbl_subtitle.configure(text="Touch ID failed — session flagged", fg=ACCENT_RED)
 
     def _update_identity_display(self):
-        if self.analysis_window_count == 0:
+        if self.analysis_window_count == 0 or self.displayed_state not in {"identified", "unknown"}:
             self._set_identity_display("running_no_data")
             return
         if self.touch_id_in_progress:
@@ -645,20 +643,22 @@ class DemoWindow(tk.Toplevel):
                 text=f"● IDENTIFIED: {self.current_identity.upper()}",
                 fg=ACCENT_GREEN,
             )
-            summary = f"{self.analysis_window_count} window(s) analyzed"
-            if self.sentence_count:
-                summary += f", {self.sentence_count} sentence(s)"
-            self.lbl_subtitle.configure(text=f"dist {self.current_dist:.2f} — {summary}", fg="#888888")
+            self.lbl_subtitle.configure(
+                text=f"dist {self.current_dist:.2f} — {self.analysis_window_count} sentence(s) analyzed",
+                fg="#888888",
+            )
         else:
             subtitle_name = self.current_closest or "?"
-            self.lbl_identity.configure(text="● UNKNOWN TYPIST", fg=ACCENT_RED)
-            summary = f"{self.analysis_window_count} window(s)"
-            if self.sentence_count:
-                summary += f", {self.sentence_count} sentence(s)"
+            title = "● IMPOSTOR DETECTED" if self.consecutive_unknown_count >= TOUCH_ID_TRIGGER_CONSECUTIVE else "● UNKNOWN TYPIST"
+            self.lbl_identity.configure(text=title, fg=ACCENT_RED)
             self.lbl_subtitle.configure(
-                text=f"closest: {subtitle_name} (dist {self.current_dist:.2f}) — {summary}",
+                text=f"closest: {subtitle_name} (dist {self.current_dist:.2f}) — {self.analysis_window_count} sentence(s)",
                 fg=ACCENT_RED,
             )
+
+    # ------------------------------------------------------------------
+    # Profile distance bars
+    # ------------------------------------------------------------------
 
     def _update_profile_bars_init(self):
         for widget in self.bars_frame.winfo_children():
@@ -701,7 +701,7 @@ class DemoWindow(tk.Toplevel):
         if not self.all_distances:
             return
         max_display = 15.0
-        threshold = 4.5
+        threshold = float(DEFAULT_DISTANCE_THRESHOLD)
 
         for name, widgets in self._profile_bar_widgets.items():
             name_lbl, bar_canvas, dist_lbl = widgets
@@ -723,6 +723,10 @@ class DemoWindow(tk.Toplevel):
             bar_canvas.create_line(thresh_x, 0, thresh_x, 16, fill=ACCENT_YELLOW, width=1)
             name_lbl.configure(fg="#ffffff" if is_closest else "#666666")
 
+    # ------------------------------------------------------------------
+    # Confidence graph
+    # ------------------------------------------------------------------
+
     def _redraw_graph(self):
         canvas = self.graph_canvas
         canvas.delete("all")
@@ -742,47 +746,100 @@ class DemoWindow(tk.Toplevel):
             )
             return
 
-        max_display = 12.0
-        threshold = 4.5
-        thresh_y = height - int((threshold / max_display) * height)
-        canvas.create_line(0, thresh_y, width, thresh_y, fill=ACCENT_YELLOW, width=1, dash=(4, 4))
+        # margins for axes
+        PAD_L = 48
+        PAD_B = 24
+        PAD_T = 12
+        PAD_R = 12
+        plot_w = width - PAD_L - PAD_R
+        plot_h = height - PAD_T - PAD_B
+
+        threshold = float(DEFAULT_DISTANCE_THRESHOLD)
+        dists = [d for (_, _, d, _) in self.score_history]
+        data_max = max(dists)
+        # ensure threshold and a little headroom are always visible
+        y_max = max(data_max * 1.15, threshold * 1.3, 1.0)
+        y_min = 0.0
+
+        def to_canvas(idx: int, dist: float) -> Tuple[int, int]:
+            n = len(self.score_history)
+            x = PAD_L + int(idx / max(1, n - 1) * plot_w)
+            frac = (dist - y_min) / (y_max - y_min)
+            y = PAD_T + plot_h - int(frac * plot_h)
+            y = max(PAD_T + 2, min(PAD_T + plot_h - 2, y))
+            return x, y
+
+        # --- grid lines ---
+        num_y_ticks = 5
+        for i in range(num_y_ticks + 1):
+            val = y_min + (y_max - y_min) * i / num_y_ticks
+            _, cy = to_canvas(0, val)
+            canvas.create_line(PAD_L, cy, PAD_L + plot_w, cy, fill="#222222", width=1)
+            canvas.create_text(
+                PAD_L - 4, cy,
+                text=f"{val:.0f}",
+                fill="#555555",
+                font=("Menlo", 8),
+                anchor="e",
+            )
+
+        # --- threshold line ---
+        _, thresh_y = to_canvas(0, threshold)
+        canvas.create_line(
+            PAD_L, thresh_y, PAD_L + plot_w, thresh_y,
+            fill=ACCENT_YELLOW, width=1, dash=(4, 3),
+        )
         canvas.create_text(
-            width - 4,
-            thresh_y - 6,
-            text="threshold",
+            PAD_L + plot_w - 2, thresh_y - 5,
+            text=f"threshold ({threshold:.0f})",
             fill=ACCENT_YELLOW,
             font=("Menlo", 8),
             anchor="e",
         )
 
+        # --- axes ---
+        canvas.create_line(PAD_L, PAD_T, PAD_L, PAD_T + plot_h, fill="#444444", width=1)
+        canvas.create_line(PAD_L, PAD_T + plot_h, PAD_L + plot_w, PAD_T + plot_h, fill="#444444", width=1)
+
+        # --- y axis label ---
+        canvas.create_text(
+            8, PAD_T + plot_h // 2,
+            text="distance",
+            fill="#555555",
+            font=("Menlo", 8),
+            angle=90,
+            anchor="center",
+        )
+
+        # --- data line and points ---
         points: List[Tuple[int, int]] = []
-        n = len(self.score_history)
         for idx, (_, _, dist, _) in enumerate(self.score_history):
-            x = int(idx / max(1, n - 1) * width)
-            y = height - int(min(1.0, dist / max_display) * height)
-            y = max(2, min(height - 2, y))
-            points.append((x, y))
+            points.append(to_canvas(idx, dist))
 
         for i in range(len(points) - 1):
             x1, y1 = points[i]
             x2, y2 = points[i + 1]
-            color = ACCENT_GREEN if self.score_history[i][3] else ACCENT_RED
+            color = ACCENT_GREEN if self.score_history[i + 1][3] else ACCENT_RED
             canvas.create_line(x1, y1, x2, y2, fill=color, width=2)
 
         for idx, (x, y) in enumerate(points):
             color = ACCENT_GREEN if self.score_history[idx][3] else ACCENT_RED
             canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline="")
 
+        # --- label on last point ---
         last_x, last_y = points[-1]
         last_dist = self.score_history[-1][2]
         canvas.create_text(
-            last_x,
-            last_y - 12,
-            text=f"{last_dist:.2f}",
+            last_x, last_y - 10,
+            text=f"{last_dist:.1f}",
             fill="#ffffff",
             font=("Menlo", 9),
             anchor="s",
         )
+
+    # ------------------------------------------------------------------
+    # Stats labels
+    # ------------------------------------------------------------------
 
     def _update_votes_label(self):
         if not self.session_votes:
@@ -798,6 +855,10 @@ class DemoWindow(tk.Toplevel):
     def _update_sentence_count_label(self):
         self.lbl_sentence_count.configure(text=f"sentences: {self.sentence_count}")
 
+    # ------------------------------------------------------------------
+    # Touch ID
+    # ------------------------------------------------------------------
+
     def _trigger_touch_id(self):
         self.touch_id_in_progress = True
         self.touch_id_triggered = True
@@ -809,7 +870,6 @@ class DemoWindow(tk.Toplevel):
             thread = threading.Thread(target=self._run_touch_id_request, daemon=True)
             thread.start()
         else:
-            # Run synchronously on the Tk thread so fallback dialogs are safe.
             self.after(50, self._run_touch_id_request)
 
     def _run_touch_id_request(self):
@@ -848,6 +908,18 @@ class DemoWindow(tk.Toplevel):
         self.touch_id_triggered = False
         self.consecutive_unknown_count = 0
 
+    # ------------------------------------------------------------------
+    # Log output
+    # ------------------------------------------------------------------
+
+    def _log(self, msg: str):
+        parent = self.master
+        if parent is not None and hasattr(parent, "_log"):
+            parent._log(msg)
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
     def destroy(self):
-        self._cancel_live_window_loop()
         super().destroy()

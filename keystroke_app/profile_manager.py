@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from .config import DEFAULT_DISTANCE_THRESHOLD
 from .storage import load_session_data
 from .verifier import Verifier
 
@@ -29,13 +30,11 @@ class ProfileManager:
         verifier = Verifier()
         X = np.stack(data.enrollment_samples, axis=0)
         verifier.fit(X)
-        if data.distance_threshold:
-            verifier.distance_threshold = float(data.distance_threshold)
 
         self._profiles[profile_name] = ProfileEntry(name=profile_name, dataset_path=path, verifier=verifier)
 
     def identify(
-        self, X: np.ndarray, unknown_threshold: float = 4.5
+        self, X: np.ndarray, unknown_threshold: float = DEFAULT_DISTANCE_THRESHOLD
     ) -> Tuple[Optional[str], float, Dict[str, float]]:
         if not self._profiles:
             raise ValueError("No profiles loaded. Use load_profile() first.")
