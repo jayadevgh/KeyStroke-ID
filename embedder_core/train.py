@@ -16,7 +16,7 @@ from .vocab import build_keysym_vocab
 
 @dataclass
 class TrainConfig:
-    epochs: int = 100
+    epochs: int = 200
     batch_size: int = 32
     lr: float = 2e-4
     weight_decay: float = 0.01
@@ -27,7 +27,7 @@ class TrainConfig:
     num_workers: int = 0
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    early_stop_patience: int = 20
+    early_stop_patience: int = 50
     save_path: str = "keystroke_user_classifier_keysym.pt"
     final_weights_path: str = "keystroke_user_classifier_keysym_final_weights.pt"
     pca_plot_path: str = "keystroke_user_classifier_keysym_pca.png"
