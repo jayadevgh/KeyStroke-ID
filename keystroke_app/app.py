@@ -14,6 +14,7 @@ from .config import (
     PROMPT_QUEUE_SIZE,
     SENTENCE_DATASET_PATH,
 )
+from .demo_window import DemoWindow
 from .embedder_runtime import EmbedderRuntime, try_load_default_embedder_runtime
 from .profile_manager import ProfileManager
 from .prompts import PromptQueue, load_sentence_bank
@@ -46,6 +47,7 @@ class App(tk.Tk):
         self.embedder_runtime: Optional[EmbedderRuntime] = None
         self.feature_backend_name: str = "handcrafted"
         self._embedder_startup_message: str = ""
+        self._demo_window: Optional[DemoWindow] = None
 
         runtime, runtime_msg = try_load_default_embedder_runtime()
         if runtime is not None:
@@ -167,6 +169,13 @@ class App(tk.Tk):
 
         self.btn_reset = ttk.Button(ctrl, text="Reset", command=self.reset_all)
         self.btn_reset.pack(side="left", padx=(8, 0))
+
+        self.btn_launch_demo = ttk.Button(
+            ctrl,
+            text="Launch Demo ▶",
+            command=self.launch_demo_window,
+        )
+        self.btn_launch_demo.pack(side="right", padx=(8, 0))
 
         multi = ttk.LabelFrame(frm, text="Multi-Profile Identification", padding=8)
         multi.pack(fill="both", expand=False, pady=(0, 10))
@@ -296,6 +305,7 @@ class App(tk.Tk):
             self.lst_profiles.insert("end", name)
         self.profile_status_var.set(f"Loaded profiles: {len(names)}")
         self._update_live_id_button_state()
+        self._sync_demo_window_profiles()
 
     def _update_live_id_button_state(self):
         if not hasattr(self, "btn_live_id_start"):
@@ -303,6 +313,14 @@ class App(tk.Tk):
         can_start = self.phase in ("idle", "done") and len(self.profile_manager.list_profiles()) >= 1
         self.btn_live_id_start.configure(state="normal" if can_start else "disabled")
         self.btn_live_id_stop.configure(state="normal" if self.phase == "live_id" else "disabled")
+
+    def _sync_demo_window_profiles(self):
+        if self._demo_window is None:
+            return
+        try:
+            self._demo_window._update_idle_ui()
+        except tk.TclError:
+            self._demo_window = None
 
     @staticmethod
     def _parse_target_runs(raw_value: str, label: str) -> int:
@@ -442,6 +460,27 @@ class App(tk.Tk):
         self._update_profile_listbox()
         self._log("Cleared all profiles.")
         self._update_live_id_button_state()
+
+    def launch_demo_window(self):
+        if self._demo_window is not None:
+            try:
+                self._demo_window.lift()
+                self._demo_window.focus_force()
+                return
+            except tk.TclError:
+                self._demo_window = None
+
+        self._demo_window = DemoWindow(
+            parent=self,
+            profile_manager=self.profile_manager,
+            sentence_bank=SENTENCE_BANK,
+            get_feature_fn=self._build_run_feature,
+        )
+        self._demo_window.set_backend_label(self.feature_backend_name)
+        try:
+            self._demo_window._update_idle_ui()
+        except tk.TclError:
+            self._demo_window = None
 
     def _reset_live_id_state(self):
         self.live_id_state = "unknown"
